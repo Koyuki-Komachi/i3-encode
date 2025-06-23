@@ -112,13 +112,15 @@ void audio_sender(int sock_fd) {
         // --- 圧縮処理 ---
         // 簡単な実装として、スペクトルの後半部分をカットする
         // FFTの結果は対称的なので、後半をカットしても情報を大きく失わない
-        int compression_index = (int)(FRAME_SIZE / 2 * (1.0 - COMPRESSION_RATIO));
-        for (int i = compression_index; i < FRAME_SIZE - compression_index; i++) {
-             if (i > FRAME_SIZE/2) { // Skip DC component and Nyquist
-                fft_buffer[i].re = 0;
-                fft_buffer[i].im = 0;
-             }
-        }
+        // 高周波成分をカットする場合
+        int cutoff_index = (int)(FRAME_SIZE / 2 * (1.0 - COMPRESSION_RATIO));
+        for (int i = cutoff_index; i < FRAME_SIZE / 2; i++) {
+            fft_buffer[i].re = 0;
+            fft_buffer[i].im = 0;
+        // 対称性を保つため対応する負の周波数もゼロ化
+            fft_buffer[FRAME_SIZE - i].re = 0;
+            fft_buffer[FRAME_SIZE - i].im = 0;
+}
         
         // 圧縮したデータを送信
         write(sock_fd, fft_buffer, FFT_BYTES);
