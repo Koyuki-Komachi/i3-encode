@@ -14,6 +14,10 @@
 #define SAMPLE_RATE 16000           // サンプリングレート (Hz)
 #define NUM_BANDS 32                // 周波数帯域の分割数
 
+// 電話帯域の設定
+#define PHONE_BAND_LOW_HZ 300      // 電話帯域の下限 (Hz)
+#define PHONE_BAND_HIGH_HZ 3400    // 電話帯域の上限 (Hz)
+
 #define PI 3.14159265358979323846
 
 // 1フレームあたりのデータサイズ (16bit = 2byte)
@@ -43,6 +47,100 @@ typedef struct {
     int phase_bits;     // 位相の量子化ビット数
     float threshold_db; // 最小可聴値 (dB)
 } BandConfig;
+
+// 圧縮方法の選択
+typedef enum {
+    COMPRESS_PSYCHOACOUSTIC = 1,  // 心理音響圧縮
+    COMPRESS_PHONE_BAND = 2       // 電話帯域制限
+} CompressionMethod;
+
+// グローバル変数
+CompressionMethod g_compression_method = COMPRESS_PSYCHOACOUSTIC;
+int g_phone_band_low_bin, g_phone_band_high_bin;  // 電話帯域のビン番号
+
+// --- 電話帯域制限機能 ---
+
+// 電話帯域のビン番号を計算
+void init_phone_band_bins() {
+    g_phone_band_low_bin = (int)((float)PHONE_BAND_LOW_HZ * FRAME_SIZE / SAMPLE_RATE);
+    g_phone_band_high_bin = (int)((float)PHONE_BAND_HIGH_HZ * FRAME_SIZE / SAMPLE_RATE);
+    
+    // 範囲チェック
+    if (g_phone_band_low_bin < 0) g_phone_band_low_bin = 0;
+    if (g_phone_band_high_bin >= FRAME_SIZE/2) g_phone_band_high_bin = FRAME_SIZE/2 - 1;
+    
+    fprintf(stderr, "Phone band filtering: %d Hz - %d Hz (bins %d - %d)\n",
+            PHONE_BAND_LOW_HZ, PHONE_BAND_HIGH_HZ, 
+            g_phone_band_low_bin, g_phone_band_high_bin);
+}
+
+// 電話帯域制限を適用
+void apply_phone_band_filter(Complex *fft_data) {
+    // 低周波成分を0にする
+    for (int i = 0; i < g_phone_band_low_bin; i++) {
+        fft_data[i].re = 0.0;
+        fft_data[i].im = 0.0;
+        // 対称成分も0にする
+        fft_data[FRAME_SIZE - 1 - i].re = 0.0;
+        fft_data[FRAME_SIZE - 1 - i].im = 0.0;
+    }
+    
+    // 高周波成分を0にする
+    for (int i = g_phone_band_high_bin + 1; i < FRAME_SIZE/2; i++) {
+        fft_data[i].re = 0.0;
+        fft_data[i].im = 0.0;
+        // 対称成分も0にする
+        fft_data[FRAME_SIZE - i].re = 0.0;
+        fft_data[FRAME_SIZE - i].im = 0.0;
+    }
+}
+
+// 電話帯域データの圧縮（有効な帯域のみ送信）
+void phone_band_compress(Complex *fft_data, unsigned char *compressed_data, int *compressed_size) {
+    int write_pos = 0;
+    
+    // 有効な帯域のみを圧縮データに格納
+    for (int i = g_phone_band_low_bin; i <= g_phone_band_high_bin; i++) {
+        // 実部と虚部を float として格納
+        float real_part = (float)fft_data[i].re;
+        float imag_part = (float)fft_data[i].im;
+        
+        memcpy(&compressed_data[write_pos], &real_part, sizeof(float));
+        write_pos += sizeof(float);
+        memcpy(&compressed_data[write_pos], &imag_part, sizeof(float));
+        write_pos += sizeof(float);
+    }
+    
+    *compressed_size = write_pos;
+}
+
+// 電話帯域データの展開
+void phone_band_decompress(unsigned char *compressed_data, Complex *fft_data, int compressed_size) {
+    // FFTバッファを初期化
+    memset(fft_data, 0, FRAME_SIZE * sizeof(Complex));
+    
+    int read_pos = 0;
+    
+    // 有効な帯域のデータを復元
+    for (int i = g_phone_band_low_bin; i <= g_phone_band_high_bin && read_pos < compressed_size; i++) {
+        if (read_pos + sizeof(float) * 2 > compressed_size) break;
+        
+        float real_part, imag_part;
+        memcpy(&real_part, &compressed_data[read_pos], sizeof(float));
+        read_pos += sizeof(float);
+        memcpy(&imag_part, &compressed_data[read_pos], sizeof(float));
+        read_pos += sizeof(float);
+        
+        fft_data[i].re = (double)real_part;
+        fft_data[i].im = (double)imag_part;
+        
+        // 対称性を保つ（実数信号のため）
+        if (i > 0 && i < FRAME_SIZE/2) {
+            fft_data[FRAME_SIZE - i].re = fft_data[i].re;
+            fft_data[FRAME_SIZE - i].im = -fft_data[i].im;
+        }
+    }
+}
 
 // --- 心理音響モデル ---
 
@@ -195,7 +293,7 @@ void psychoacoustic_decompress(unsigned char *compressed_data, Complex *fft_data
     }
 }
 
-// --- FFT / IFFT 実装 (前回と同じ) ---
+// --- FFT / IFFT 実装 ---
 
 void fft(Complex *x, int N) {
     if (N <= 1) return;
@@ -255,7 +353,7 @@ void signal_handler(int sig) {
     exit(0);
 }
 
-// 送信プロセス: 標準入力 → FFT → 心理音響圧縮 → ソケット
+// 送信プロセス
 void audio_sender(int sock_fd) {
     short pcm_buffer[FRAME_SIZE];
     Complex fft_buffer[FRAME_SIZE];
@@ -271,9 +369,18 @@ void audio_sender(int sock_fd) {
         // FFT実行
         fft(fft_buffer, FRAME_SIZE);
 
-        // 心理音響圧縮
         int compressed_size;
-        psychoacoustic_compress(fft_buffer, compressed_data, g_bands, &compressed_size);
+        
+        // 圧縮方法に応じて処理
+        if (g_compression_method == COMPRESS_PHONE_BAND) {
+            // 電話帯域制限を適用
+            apply_phone_band_filter(fft_buffer);
+            // 電話帯域圧縮
+            phone_band_compress(fft_buffer, compressed_data, &compressed_size);
+        } else {
+            // 心理音響圧縮
+            psychoacoustic_compress(fft_buffer, compressed_data, g_bands, &compressed_size);
+        }
         
         // 圧縮サイズを先に送信
         write(sock_fd, &compressed_size, sizeof(int));
@@ -283,15 +390,20 @@ void audio_sender(int sock_fd) {
         // 圧縮率を表示
         static int frame_count = 0;
         if (++frame_count % 100 == 0) {
-            float compression_ratio = (float)compressed_size / FFT_BYTES;
-            fprintf(stderr, "Compression ratio: %.2f%% (Frame %d)\n", 
-                   compression_ratio * 100, frame_count);
+            int original_size = (g_compression_method == COMPRESS_PHONE_BAND) ? 
+                               ((g_phone_band_high_bin - g_phone_band_low_bin + 1) * 2 * sizeof(double)) : 
+                               FFT_BYTES;
+            float compression_ratio = (float)compressed_size / original_size;
+            const char* method_name = (g_compression_method == COMPRESS_PHONE_BAND) ? 
+                                    "Phone Band" : "Psychoacoustic";
+            fprintf(stderr, "%s compression ratio: %.2f%% (Frame %d)\n", 
+                   method_name, compression_ratio * 100, frame_count);
         }
     }
     exit(0);
 }
 
-// 受信プロセス: ソケット → 心理音響展開 → IFFT → 標準出力
+// 受信プロセス
 void audio_receiver(int sock_fd) {
     short pcm_buffer[FRAME_SIZE];
     Complex fft_buffer[FRAME_SIZE];
@@ -306,8 +418,14 @@ void audio_receiver(int sock_fd) {
         // 圧縮データを受信
         if (read(sock_fd, compressed_data, compressed_size) != compressed_size) break;
         
-        // 心理音響展開
-        psychoacoustic_decompress(compressed_data, fft_buffer, g_bands, compressed_size);
+        // 圧縮方法に応じて展開
+        if (g_compression_method == COMPRESS_PHONE_BAND) {
+            // 電話帯域展開
+            phone_band_decompress(compressed_data, fft_buffer, compressed_size);
+        } else {
+            // 心理音響展開
+            psychoacoustic_decompress(compressed_data, fft_buffer, g_bands, compressed_size);
+        }
 
         // IFFT実行
         ifft(fft_buffer, FRAME_SIZE);
@@ -359,18 +477,44 @@ int main(int argc, char **argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // 心理音響モデルの初期化
-    fprintf(stderr, "Initializing psychoacoustic model...\n");
-    init_band_config(g_bands);
+    // コマンドライン引数の解析
+    int compression_method = 1;  // デフォルトは心理音響圧縮
+    int arg_start = 1;
+    
+    if (argc >= 2 && (strcmp(argv[1], "-p") == 0 || strcmp(argv[1], "--psychoacoustic") == 0)) {
+        compression_method = 1;
+        arg_start = 2;
+    } else if (argc >= 2 && (strcmp(argv[1], "-b") == 0 || strcmp(argv[1], "--phone-band") == 0)) {
+        compression_method = 2;
+        arg_start = 2;
+    }
+    
+    g_compression_method = (CompressionMethod)compression_method;
+    
+    if (g_compression_method == COMPRESS_PSYCHOACOUSTIC) {
+        fprintf(stderr, "Using psychoacoustic compression\n");
+        init_band_config(g_bands);
+    } else {
+        fprintf(stderr, "Using phone band compression (300-3400 Hz)\n");
+        init_phone_band_bins();
+    }
 
-    if (argc == 2) {
-        run_server(atoi(argv[1]));
-    } else if (argc == 3) {
-        run_client(argv[1], atoi(argv[2]));
+    // ネットワーク設定
+    if (argc - arg_start == 1) {
+        run_server(atoi(argv[arg_start]));
+    } else if (argc - arg_start == 2) {
+        run_client(argv[arg_start], atoi(argv[arg_start + 1]));
     } else {
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  Server: %s <port>\n", argv[0]);
-        fprintf(stderr, "  Client: %s <ip> <port>\n", argv[0]);
+        fprintf(stderr, "  Options:\n");
+        fprintf(stderr, "    -p, --psychoacoustic  Use psychoacoustic compression (default)\n");
+        fprintf(stderr, "    -b, --phone-band      Use phone band compression (300-3400 Hz)\n");
+        fprintf(stderr, "  Server: %s [options] <port>\n", argv[0]);
+        fprintf(stderr, "  Client: %s [options] <ip> <port>\n", argv[0]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  %s -p 12345                    # Psychoacoustic compression server\n", argv[0]);
+        fprintf(stderr, "  %s -b 127.0.0.1 12345         # Phone band compression client\n", argv[0]);
         return 1;
     }
 
